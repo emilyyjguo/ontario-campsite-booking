@@ -38,56 +38,62 @@ function getArg(name) {
   return pair ? pair.slice(flag.length + 1) : undefined;
 }
 
-// ─── Configuration ──────────────────────────────────────────────────────────
+// ─── User Configuration ──────────────────────────────────────────────────────
+// Edit the values in this block before each booking run.
 
-// Booking start date (from URL). The window opens at 7:00 AM exactly
-// 5 months before this date (Ontario Parks rule).
-const BOOKING_START_DATE = '2026-10-08'; // YYYY-MM-DD — your check-in date
-const BOOKING_END_DATE   = '2026-10-09'; // YYYY-MM-DD — your check-out date
+// ── Booking dates ──
+const BOOKING_START_DATE = '2026-10-08'; // YYYY-MM-DD — check-in date
+const BOOKING_END_DATE   = '2026-10-09'; // YYYY-MM-DD — check-out date (nights auto-computed)
 
-// Compute nights automatically from the two dates above
+// ── Ontario Parks login credentials ──
+const LOGIN_EMAIL    = 'victoryssmile@hotmail.com';
+const LOGIN_PASSWORD = '';
+
+// ── Campsite priority list ──
+// Sites are tried in order — first available wins.
+// Override at runtime with: --sites 228,201,210
+const DEFAULT_SITES = ['228', '191', '189'];
+
+// ── Timing (seconds before 7:00 AM) ──
+const PRE_RELOAD_SECONDS = 60;  // reload booking page this many seconds before window opens
+const PRE_LOGIN_SECONDS  = 300; // start login this many seconds before window opens (≥ PRE_RELOAD_SECONDS)
+
+// ─── Derived values (do not edit) ────────────────────────────────────────────
+
 const _msPerDay = 24 * 60 * 60 * 1000;
 const BOOKING_NIGHTS = Math.round(
   (new Date(BOOKING_END_DATE) - new Date(BOOKING_START_DATE)) / _msPerDay
 );
 
-/**
- * Compute the booking-open datetime: 7:00 AM on the date 5 months
- * before the campsite start date, in the local system timezone.
- */
 function computeBookingOpenTime(startDateStr) {
   const [year, month, day] = startDateStr.split('-').map(Number);
-  // Subtract 5 months
   let openMonth = month - 5;
   let openYear = year;
   if (openMonth <= 0) { openMonth += 12; openYear -= 1; }
-  const openDate = new Date(openYear, openMonth - 1, day, 7, 0, 0, 0);
-  return openDate;
+  // return new Date(openYear, openMonth - 1, day, 7, 0, 0, 0); // ← PRODUCTION: 7:00 AM
+  const t = new Date(Date.now() + 2 * 60 * 1000);               // ← TESTING:    2 minutes from now, :00 seconds
+  t.setSeconds(0, 0);
+  return t;
 }
 
-// Sites to try — can be overridden with --sites 228,201,210
-const defaultSites = ['228', '191', '189'];
 const sitesArg = getArg('sites');
-const siteLabels = sitesArg ? sitesArg.split(',').map((s) => s.trim()) : defaultSites;
+const siteLabels = sitesArg ? sitesArg.split(',').map((s) => s.trim()) : DEFAULT_SITES;
 
-// Max retries per site — can be overridden with --attempts 10
 const attemptsArg = getArg('attempts');
 const maxRetryAttempts = attemptsArg ? parseInt(attemptsArg, 10) : 200;
 
 const CONFIG = {
-  // Ordered list of sites to try (1st = highest priority).
-  // Pass --sites 228,201,210 to override.
-  sites: siteLabels.map((label) => ({ label })),
+  // ── Mirrors the user-editable constants above ──
+  loginEmail:            LOGIN_EMAIL,
+  loginPassword:         LOGIN_PASSWORD,
+  sites:                 siteLabels.map((label) => ({ label })),
+  preReloadSecondsBefore: PRE_RELOAD_SECONDS,
+  preLoginSecondsBefore:  PRE_LOGIN_SECONDS,
 
-  // Start hammering Reserve 1 minute before the booking window opens
-  preLoadSecondsBefore: 60,
-
-  // Computed from BOOKING_START_DATE: 7:00 AM, 5 months before start date
+  // Computed booking-open time: 7:00 AM, 5 months before start date
   bookingOpenTime: computeBookingOpenTime(BOOKING_START_DATE),
 
-  // Max retry attempts when "not yet allowed" sidebar alert is shown.
-  // ~300 ms per attempt → 200 attempts ≈ 60 s of retrying.
-  // Override with --attempts N.
+  // Max retry attempts. ~300 ms each → 200 ≈ 60 s. Override with --attempts N.
   maxRetryAttempts,
 
   // Base URL — searchTime is replaced dynamically at runtime
@@ -108,10 +114,7 @@ const CONFIG = {
     + '&filterData=%7B%22-32736%22:%22%5B%5B1%5D,0,0,0%5D%22,%22-32726%22:%22%5B%5B1%5D,0,0,0%5D%22%7D'
     + '&flexibleSearch=%5Bfalse,false,%222026-05-01%22,1%5D',
 
-  // Run with a visible browser window so you can monitor progress
   headless: false,
-
-  // How long to wait for the map to fully render after page load (ms)
   mapRenderTimeout: 40000,
 };
 
@@ -122,14 +125,15 @@ function sleep(ms) {
 }
 
 function log(msg) {
-  console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
+  const n = new Date();
+  const ts = `${n.getHours().toString().padStart(2,'0')}:${n.getMinutes().toString().padStart(2,'0')}:${n.getSeconds().toString().padStart(2,'0')}.${n.getMilliseconds().toString().padStart(3,'0')}`;
+  console.log(`[${ts}] ${msg}`);
 }
 
-/** Returns the target Date (1 minute before booking open) or null if already past. */
-function getTargetTime() {
+/** Returns the login start time (PRE_LOGIN_SECONDS before booking opens) or null if already past. */
+function getLoginStartTime() {
   const now = new Date();
-  // Start attempting 1 minute before the window opens
-  const target = new Date(CONFIG.bookingOpenTime.getTime() - 60 * 1000);
+  const target = new Date(CONFIG.bookingOpenTime.getTime() - CONFIG.preLoginSecondsBefore * 1000);
   return target > now ? target : null;
 }
 
@@ -154,19 +158,143 @@ async function waitUntil(targetMs) {
   }
 }
 
+// ─── Browser helpers ─────────────────────────────────────────────────────────
+
+/** Dismiss the Ontario Parks cookie consent banner if present. */
+async function dismissCookieBanner(page) {
+  const dismissed = await page.evaluate(() => {
+    const container = document.querySelector('mat-dialog-container');
+    if (!container) return false;
+    const text = container.textContent || '';
+    if (!text.includes('cookies')) return false;
+    const btn =
+      container.querySelector('button[id*="accept"]') ||
+      container.querySelector('button[id*="close"]') ||
+      container.querySelector('button[id*="agree"]') ||
+      container.querySelector('button');
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+  if (dismissed) {
+    log('Cookie consent banner dismissed.');
+    await sleep(400);
+  }
+}
+
+/**
+ * Log in to Ontario Parks, then navigate to the booking URL on the same tab.
+ * Steps: click "Sign in" → fill email + password → submit → navigate to booking URL.
+ */
+async function performLogin(page) {
+  log('Navigating to booking page for login…');
+  await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
+  await dismissCookieBanner(page);
+
+  // If already logged in (no "Sign in" button visible), skip login
+  const signInFound = await page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll('button, a'));
+    const btn = all.find((el) => el.textContent.trim() === 'Sign in');
+    if (btn) { btn.click(); return true; }
+    return false;
+  });
+
+  if (!signInFound) {
+    log('Sign in button not found — may already be logged in, continuing…');
+    return;
+  }
+
+  log('Sign in clicked — waiting for email input…');
+
+  // Wait for the email field to appear (handles both modal and page navigation)
+  try {
+    await page.waitForSelector('input[type="email"]', { state: 'attached', timeout: 10000 });
+  } catch {
+    log('WARNING: Email input did not appear within 10 s — login form may not have opened.');
+    return;
+  }
+
+  log('Login form ready — filling credentials…');
+
+  // Use Playwright's native fill() which works reliably with Angular reactive forms
+  await page.fill('input[type="email"]',    CONFIG.loginEmail);
+  await page.fill('input[type="password"]', CONFIG.loginPassword);
+
+  log('Credentials filled — submitting…');
+
+  // Click the submit button — try the form's submit button first, fall back to any "Sign in"
+  const submitted = await page.evaluate(() => {
+    // Look for submit button inside a form first
+    const formBtn = document.querySelector('form button[type="submit"]');
+    if (formBtn) { formBtn.click(); return 'form-submit'; }
+    // Fall back to any button with Sign in text
+    const all = Array.from(document.querySelectorAll('button'));
+    const btn = all.find((el) => el.textContent.trim() === 'Sign in');
+    if (btn) { btn.click(); return 'sign-in-btn'; }
+    return null;
+  });
+
+  if (!submitted) {
+    log('WARNING: Could not find submit button — trying Enter key…');
+    await page.keyboard.press('Enter');
+  } else {
+    log(`Submitted via ${submitted}.`);
+  }
+
+  // Wait for the full OAuth redirect chain AND for Angular to process the auth token.
+  // Ontario Parks uses a code-exchange flow: login → redirect with ?code=xxx → Angular
+  // processes the code → sets session → renders "Welcome,". We MUST wait for that final
+  // render before navigating away, otherwise the in-flight token exchange is interrupted.
+  log('Waiting for auth redirect and session initialization…');
+  try {
+    await page.waitForFunction(
+      () => Array.from(document.querySelectorAll('span')).some((el) => el.textContent.includes('Welcome,')),
+      { timeout: 25000, polling: 500 }
+    );
+    log('Login verified — "Welcome," span found, session is initialized.');
+  } catch {
+    log('WARNING: "Welcome," span did not appear within 25 s — login may have failed.');
+  }
+
+  // Give Angular one more tick to persist auth tokens to storage before we navigate.
+  await sleep(1500);
+
+  // Now it is safe to navigate — the session cookie/token is fully saved.
+  log(`Navigating to booking URL on same tab (currently: ${page.url()})…`);
+  await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
+  await dismissCookieBanner(page);
+
+  // Confirm session survived the navigation
+  const sessionOk = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('span')).some((el) => el.textContent.includes('Welcome,'))
+  );
+  if (sessionOk) {
+    log('Session confirmed on booking page — ready to book.');
+  } else {
+    log('WARNING: Session lost after navigating to booking page — you may need to log in manually.');
+  }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function bookCampsite() {
   const runNow = process.argv.includes('--now');
   const debugMode = process.argv.includes('--debug');
-  const targetTime = runNow ? null : getTargetTime();
+  const loginStartTime = runNow ? null : getLoginStartTime();
 
   const openTimeStr = CONFIG.bookingOpenTime.toLocaleString();
+  const secsUntilOpen = Math.round((CONFIG.bookingOpenTime.getTime() - Date.now()) / 1000);
+  const minsUntilOpen = Math.round(secsUntilOpen / 60);
   log('Ontario Parks Campsite Auto-Booker starting…');
   log(`Sites (priority order): ${CONFIG.sites.map((s) => s.label).join(' → ')}`);
   log(`Booking opens         : ${openTimeStr}`);
+  if (secsUntilOpen > 0) {
+    log(`⏳  Booking starts in  : ${minsUntilOpen >= 2 ? `~${minsUntilOpen} minutes` : `~${secsUntilOpen} seconds`}`);
+  } else {
+    log('⏳  Booking window is already open — starting immediately.');
+  }
   log(`Max attempts per site : ${CONFIG.maxRetryAttempts}`);
-  log(`Start hammering at    : T-60s (${new Date(CONFIG.bookingOpenTime.getTime() - 60000).toLocaleTimeString()})`);
+  log(`Login starts at       : T-${CONFIG.preLoginSecondsBefore}s (${new Date(CONFIG.bookingOpenTime.getTime() - CONFIG.preLoginSecondsBefore * 1000).toLocaleTimeString()})`);
+  log(`Page reloads at       : T-${CONFIG.preReloadSecondsBefore}s (${new Date(CONFIG.bookingOpenTime.getTime() - CONFIG.preReloadSecondsBefore * 1000).toLocaleTimeString()})`);
   log('Pass --sites 228,201,210 to change priority  |  --attempts N to change retries');
 
   // ── Launch browser or connect to existing Chrome ────────────────────────
@@ -191,49 +319,62 @@ async function bookCampsite() {
 
   const page = await browserContext.newPage();
 
-  // ── Pre-load or wait ────────────────────────────────────────────────────
-  if (targetTime) {
-    const preLoadMs = targetTime.getTime(); // targetTime is already T-60s
-
-    if (Date.now() < preLoadMs) {
-      log(`Waiting to pre-load page (T-60s before booking opens)…`);
-      await waitUntil(preLoadMs);
+  // ── Login → wait → reload → wait for 7:00 AM → final reload ─────────────
+  if (loginStartTime) {
+    if (Date.now() < loginStartTime.getTime()) {
+      log(`Waiting to start login (T-${CONFIG.preLoginSecondsBefore}s before booking opens)…`);
+      await waitUntil(loginStartTime.getTime());
     }
 
-    log('Pre-loading map page…');
-    await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
-    log(`Page loaded. Waiting for booking window to open at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
-    await waitUntil(CONFIG.bookingOpenTime.getTime());
+    await performLogin(page);
 
-    // Reload with a fresh searchTime at the exact moment
-    log('⏰  Booking window open! Reloading with fresh search time…');
+    // Wait until PRE_RELOAD_SECONDS before 7:00 AM, then reload with fresh searchTime
+    const reloadMs = CONFIG.bookingOpenTime.getTime() - CONFIG.preReloadSecondsBefore * 1000;
+    if (Date.now() < reloadMs) {
+      log(`Waiting to reload page (T-${CONFIG.preReloadSecondsBefore}s before booking opens)…`);
+      await waitUntil(reloadMs);
+    }
+    log('Reloading map with fresh search time…');
     await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
+    await dismissCookieBanner(page);
+
+    // Wait until exactly 7:00 AM, then do the final reload
+    log(`Waiting for booking window to open at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
+    await waitUntil(CONFIG.bookingOpenTime.getTime());
+    const _t1 = new Date();
+    log(`⏰  Booking window open! Started at ${_t1.getHours().toString().padStart(2,'0')}:${_t1.getMinutes().toString().padStart(2,'0')}:${_t1.getSeconds().toString().padStart(2,'0')}.${_t1.getMilliseconds().toString().padStart(3,'0')}`);
+    log('Reloading with fresh search time…');
+    await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
+    await dismissCookieBanner(page);
+  } else if (runNow) {
+    // --now mode: login immediately and skip all waiting
+    const _tNow = new Date();
+    log(`⏰  Running immediately (--now mode). Booking started at ${_tNow.getHours().toString().padStart(2,'0')}:${_tNow.getMinutes().toString().padStart(2,'0')}:${_tNow.getSeconds().toString().padStart(2,'0')}.${_tNow.getMilliseconds().toString().padStart(3,'0')}`);
+    await performLogin(page);
   } else {
-    log('Running immediately (--now mode)…');
+    // Already past the login start time — login now, then still wait for bookingOpenTime
+    log('Past login start time — logging in now and waiting for booking window…');
+    await performLogin(page);
+
+    const reloadMs = CONFIG.bookingOpenTime.getTime() - CONFIG.preReloadSecondsBefore * 1000;
+    if (Date.now() < reloadMs) {
+      log(`Waiting to reload page (T-${CONFIG.preReloadSecondsBefore}s before booking opens)…`);
+      await waitUntil(reloadMs);
+    }
+    log('Reloading map with fresh search time…');
     await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
+    await dismissCookieBanner(page);
+
+    log(`Waiting for booking window to open at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
+    await waitUntil(CONFIG.bookingOpenTime.getTime());
+    const _t2 = new Date();
+    log(`⏰  Booking window open! Started at ${_t2.getHours().toString().padStart(2,'0')}:${_t2.getMinutes().toString().padStart(2,'0')}:${_t2.getSeconds().toString().padStart(2,'0')}.${_t2.getMilliseconds().toString().padStart(3,'0')}`);
+    log('Reloading with fresh search time…');
+    await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
+    await dismissCookieBanner(page);
   }
 
   log('Map fully rendered.');
-
-  // ── Dismiss cookie consent banner if present ─────────────────────────────
-  const cookieDismissed = await page.evaluate(() => {
-    const container = document.querySelector('mat-dialog-container');
-    if (!container) return false;
-    const text = container.textContent || '';
-    if (!text.includes('cookies')) return false;
-    // Try common accept/close buttons inside the cookie banner
-    const btn =
-      container.querySelector('button[id*="accept"]') ||
-      container.querySelector('button[id*="close"]') ||
-      container.querySelector('button[id*="agree"]') ||
-      container.querySelector('button');
-    if (btn) { btn.click(); return true; }
-    return false;
-  });
-  if (cookieDismissed) {
-    log('Cookie consent banner dismissed.');
-    await sleep(400);
-  }
 
 
   if (debugMode) {
