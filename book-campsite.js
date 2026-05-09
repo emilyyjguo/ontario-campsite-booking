@@ -52,7 +52,7 @@ const LOGIN_PASSWORD = '';
 // ── Campsite priority list ──
 // Sites are tried in order — first available wins.
 // Override at runtime with: --sites 228,201,210
-const DEFAULT_SITES = ['228', '191', '189'];
+const DEFAULT_SITES = ['228', '234', '237'];
 
 // ── Timing (seconds before 7:00 AM) ──
 const PRE_RELOAD_SECONDS = 60;  // reload booking page this many seconds before window opens
@@ -338,14 +338,9 @@ async function bookCampsite() {
     await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
     await dismissCookieBanner(page);
 
-    // Wait until exactly 7:00 AM, then do the final reload
-    log(`Waiting for booking window to open at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
-    await waitUntil(CONFIG.bookingOpenTime.getTime());
-    const _t1 = new Date();
-    log(`⏰  Booking window open! Started at ${_t1.getHours().toString().padStart(2,'0')}:${_t1.getMinutes().toString().padStart(2,'0')}:${_t1.getSeconds().toString().padStart(2,'0')}.${_t1.getMilliseconds().toString().padStart(3,'0')}`);
-    log('Reloading with fresh search time…');
-    await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
-    await dismissCookieBanner(page);
+    // Page is now pre-loaded at T-60s. The for-loop below will click the marker,
+    // open the sidebar, and then waitUntil(bookingOpenTime) so Reserve fires at T=0.
+    log('Booking page pre-loaded and ready — awaiting booking window inside site loop.');
   } else if (runNow) {
     // --now mode: login immediately and skip all waiting
     const _tNow = new Date();
@@ -365,16 +360,10 @@ async function bookCampsite() {
     await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
     await dismissCookieBanner(page);
 
-    log(`Waiting for booking window to open at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
-    await waitUntil(CONFIG.bookingOpenTime.getTime());
-    const _t2 = new Date();
-    log(`⏰  Booking window open! Started at ${_t2.getHours().toString().padStart(2,'0')}:${_t2.getMinutes().toString().padStart(2,'0')}:${_t2.getSeconds().toString().padStart(2,'0')}.${_t2.getMilliseconds().toString().padStart(3,'0')}`);
-    log('Reloading with fresh search time…');
-    await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
-    await dismissCookieBanner(page);
+    log('Booking page pre-loaded and ready — awaiting booking window inside site loop.');
   }
 
-  log('Map fully rendered.');
+  log('Map pre-loaded and ready.');
 
 
   if (debugMode) {
@@ -556,7 +545,15 @@ async function bookCampsite() {
       }
     }
 
-    // Steps 4–6: Click Reserve, handle dialogs, retry loop
+    // Steps 4–6: Wait until exactly bookingOpenTime, then fire Reserve.
+    // First site: waits here with sidebar already open → Reserve at T=0.000.
+    // Fallback sites: already past T=0 → waitUntil is a no-op, Reserve immediately.
+    if (Date.now() < CONFIG.bookingOpenTime.getTime()) {
+      log(`Site ${site.label} ready — waiting for booking window at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
+      await waitUntil(CONFIG.bookingOpenTime.getTime());
+    }
+    const _tR = new Date();
+    log(`⏰  Reserve firing at ${_tR.getHours().toString().padStart(2,'0')}:${_tR.getMinutes().toString().padStart(2,'0')}:${_tR.getSeconds().toString().padStart(2,'0')}.${_tR.getMilliseconds().toString().padStart(3,'0')}`);
     log(`Site ${site.label} — starting reservation attempts (max ${CONFIG.maxRetryAttempts})…`);
 
     let attempt = 0;
