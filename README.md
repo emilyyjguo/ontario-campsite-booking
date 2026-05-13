@@ -4,6 +4,24 @@ Automates campsite reservations on [Ontario Parks](https://reservations.ontariop
 
 ---
 
+## Quick Start
+
+> **Tip:** Open a new terminal, paste the block below, and the script handles everything else.
+
+```bash
+# 1. Start Chrome with remote debugging (do this once per session)
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 &
+
+# 2. Run the booker — waits for 7:00 AM automatically
+cd /Users/tg04/DEV/reservation-booking
+node book-campsite.js
+
+# Or override the site list at runtime:
+node book-campsite.js --sites 228,242,186
+```
+
+---
+
 ## Requirements
 
 - [Node.js](https://nodejs.org) v18+

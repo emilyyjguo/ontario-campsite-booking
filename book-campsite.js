@@ -42,8 +42,8 @@ function getArg(name) {
 // Edit the values in this block before each booking run.
 
 // ── Booking dates ──
-const BOOKING_START_DATE = '2026-10-08'; // YYYY-MM-DD — check-in date
-const BOOKING_END_DATE   = '2026-10-09'; // YYYY-MM-DD — check-out date (nights auto-computed)
+const BOOKING_START_DATE = '2026-10-09'; // YYYY-MM-DD — check-in date
+const BOOKING_END_DATE   = '2026-10-11'; // YYYY-MM-DD — check-out date (nights auto-computed)
 
 // ── Ontario Parks login credentials ──
 const LOGIN_EMAIL    = 'victoryssmile@hotmail.com';
@@ -52,7 +52,8 @@ const LOGIN_PASSWORD = '';
 // ── Campsite priority list ──
 // Sites are tried in order — first available wins.
 // Override at runtime with: --sites 228,201,210
-const DEFAULT_SITES = ['228', '234', '237'];
+const DEFAULT_SITES = ['228', '186', '189'];
+
 
 // ── Timing (seconds before 7:00 AM) ──
 const PRE_RELOAD_SECONDS = 60;  // reload booking page this many seconds before window opens
@@ -70,10 +71,10 @@ function computeBookingOpenTime(startDateStr) {
   let openMonth = month - 5;
   let openYear = year;
   if (openMonth <= 0) { openMonth += 12; openYear -= 1; }
-  // return new Date(openYear, openMonth - 1, day, 7, 0, 0, 0); // ← PRODUCTION: 7:00 AM
-  const t = new Date(Date.now() + 2 * 60 * 1000);               // ← TESTING:    2 minutes from now, :00 seconds
-  t.setSeconds(0, 0);
-  return t;
+  return new Date(openYear, openMonth - 1, day, 7, 0, 0, 0); // ← PRODUCTION: 7:00 AM
+//   const t = new Date(Date.now() + 3 * 60 * 1000);            // ← TESTING:    2 minutes from now, :00 seconds
+//   t.setSeconds(0, 0);
+//   return t;
 }
 
 const sitesArg = getArg('sites');
@@ -153,8 +154,9 @@ async function waitUntil(targetMs) {
     log(`Sleeping ${Math.round(coarseWait / 1000)}s (coarse)…`);
     await sleep(coarseWait);
   }
+  // Fine-grained: poll every 1 ms for the final 2 seconds → ≤1 ms overshoot
   while (Date.now() < targetMs) {
-    await sleep(50);
+    await sleep(1);
   }
 }
 
@@ -274,6 +276,260 @@ async function performLogin(page) {
   }
 }
 
+// ─── Per-site booking ────────────────────────────────────────────────────────
+
+/**
+ * Attempt to book one site on a page that is already on the booking URL.
+ * `shared` is a plain object { booked: false }.
+ * Sets shared.booked = true on success. Returns true on success, false otherwise.
+ */
+async function bookSiteOnPage(page, site, shared) {
+  const tag = `[Site ${site.label}]`;
+
+  if (shared.booked) return false;
+
+  // If the page is not already on the booking map, navigate there first.
+  const currentUrl = page.url();
+  if (!currentUrl.includes('reservations.ontarioparks.ca') || !currentUrl.includes('view=map')) {
+    log(`${tag} Navigating to booking URL…`);
+    await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
+    await dismissCookieBanner(page);
+  }
+
+  if (shared.booked) return false;
+
+  log(`${tag} Waiting for map markers…`);
+  try {
+    await page.waitForSelector('div.map-site-label', { state: 'attached', timeout: 20000 });
+  } catch {
+    log(`${tag} ERROR: Map did not render within 20 s.`);
+    return false;
+  }
+
+  const clicked = await page.evaluate((siteLabel) => {
+    const labels = Array.from(document.querySelectorAll('div.map-site-label'));
+    const label = labels.find((el) => el.textContent.trim() === siteLabel);
+    if (!label) return { ok: false, reason: 'label not found' };
+
+    // Strategy 1: label is a child of the icon div — exact, zero error
+    const parentIcon = label.closest('div.leaflet-marker-icon.map-icon');
+    if (parentIcon) {
+      parentIcon.click();
+      return { ok: true, dist: 0, method: 'closest' };
+    }
+
+    // Strategy 2: match by Leaflet CSS transform position.
+    // Both the label marker and icon marker for the same site are placed at
+    // the exact same pixel coordinate via translate3d(). This is far more
+    // reliable than pixel distance between bounding-box centers.
+    const getLabelTransform = (el) => {
+      // Walk up to find the element with a translate3d transform (the Leaflet marker root)
+      let cur = el;
+      while (cur && cur !== document.body) {
+        const t = cur.style && cur.style.transform;
+        if (t && t.includes('translate')) return { el: cur, transform: t };
+        cur = cur.parentElement;
+      }
+      return null;
+    };
+    const parseTranslate = (t) => {
+      const m = t.match(/translate3d\(\s*(-?[\d.]+)px,\s*(-?[\d.]+)px/) ||
+                t.match(/translate\(\s*(-?[\d.]+)px,\s*(-?[\d.]+)px/);
+      return m ? { x: parseFloat(m[1]), y: parseFloat(m[2]) } : null;
+    };
+
+    const labelMarkerInfo = getLabelTransform(label);
+    if (labelMarkerInfo) {
+      const lp = parseTranslate(labelMarkerInfo.transform);
+      if (lp) {
+        const icons = Array.from(document.querySelectorAll('div.leaflet-marker-icon.map-icon'));
+        let best = null, bestDist = Infinity;
+        icons.forEach((el) => {
+          const ip = parseTranslate(el.style.transform || '');
+          if (!ip) return;
+          const d = Math.hypot(ip.x - lp.x, ip.y - lp.y);
+          if (d < bestDist) { bestDist = d; best = el; }
+        });
+        if (best && bestDist < 30) {
+          best.click();
+          return { ok: true, dist: Math.round(bestDist), method: 'transform' };
+        }
+      }
+    }
+
+    // Strategy 3: icon bounding box contains the label center point
+    const lr = label.getBoundingClientRect();
+    const lx = lr.x + lr.width / 2;
+    const ly = lr.y + lr.height / 2;
+    const icons = Array.from(document.querySelectorAll('div.leaflet-marker-icon.map-icon'));
+    if (icons.length === 0) return { ok: false, reason: 'no map-icon elements found' };
+
+    const containing = icons.find((el) => {
+      const r = el.getBoundingClientRect();
+      return lx >= r.left && lx <= r.right && ly >= r.top && ly <= r.bottom;
+    });
+    if (containing) {
+      containing.click();
+      return { ok: true, dist: 0, method: 'contains' };
+    }
+
+    // Strategy 4: nearest icon by pixel distance (last resort)
+    let best2 = null, bestDist2 = Infinity;
+    icons.forEach((el) => {
+      const r = el.getBoundingClientRect();
+      const cx = r.x + r.width / 2;
+      const cy = r.y + r.height / 2;
+      const dist = Math.hypot(cx - lx, cy - ly);
+      if (dist < bestDist2) { bestDist2 = dist; best2 = el; }
+    });
+    best2.click();
+    return { ok: true, dist: Math.round(bestDist2), method: 'proximity' };
+  }, site.label);
+
+  if (!clicked.ok) {
+    log(`${tag} ERROR: Could not click icon — ${clicked.reason}.`);
+    return false;
+  }
+  log(`${tag} Icon clicked via ${clicked.method} (${clicked.dist}px from label).`);
+
+  try {
+    await page.waitForSelector('app-side-bar-site-details', { timeout: 8000 });
+  } catch {
+    log(`${tag} ERROR: Sidebar did not appear.`);
+    return false;
+  }
+
+  let siteName = '';
+  for (let i = 0; i < 20; i++) {
+    siteName = await page.locator('#resourceName').textContent({ timeout: 3000 }).catch(() => '');
+    if (siteName.includes(site.label)) break;
+    await sleep(300);
+  }
+  log(`${tag} Sidebar: "${siteName.trim()}"`);
+
+  const alertBox = page.locator('app-side-bar-site-details #sidebarRestrictiveMessageHeading');
+  const alertVisible = await alertBox.isVisible().catch(() => false);
+  if (alertVisible) {
+    const alertText = await alertBox.textContent().catch(() => '');
+    const notYetOpen =
+      alertText.includes('not yet allowed') ||
+      alertText.includes('cannot be reserved until');
+    if (notYetOpen) {
+      log(`${tag} Sidebar says not yet open — proceeding to Reserve…`);
+    } else {
+      log(`${tag} Already booked by someone else — stopping.`);
+      return false;
+    }
+  }
+
+  const nowMs = () => { const n = new Date(); return `${n.getHours().toString().padStart(2,'0')}:${n.getMinutes().toString().padStart(2,'0')}:${n.getSeconds().toString().padStart(2,'0')}.${n.getMilliseconds().toString().padStart(3,'0')}`; };
+
+  // Wait until exactly the booking open time — all tabs fire Reserve simultaneously
+  const openMs = CONFIG.bookingOpenTime.getTime();
+  if (Date.now() < openMs) {
+    log(`${tag} Pre-loaded and ready — waiting for booking window at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
+    await waitUntil(openMs);
+  }
+  log(`${tag} ⏰  Reserve starting at ${nowMs()}`);
+
+  log(`${tag} Starting reservation attempts (max ${CONFIG.maxRetryAttempts})…`);
+  let attempt = 0;
+
+  while (!shared.booked && attempt < CONFIG.maxRetryAttempts) {
+    attempt++;
+
+    const btnResult = await page.evaluate(() => {
+      const spans = Array.from(document.querySelectorAll('.mdc-button__label'));
+      const btn = spans.find((el) => el.textContent.trim() === 'Reserve');
+      if (!btn) return 'not_found';
+      const button = btn.closest('button') || btn;
+      button.click();
+      return 'clicked';
+    });
+
+    if (btnResult === 'not_found') {
+      await sleep(300);
+      continue;
+    }
+
+    log(`${tag} Attempt ${attempt} at ${nowMs()} — waiting for dialog…`);
+    await sleep(800);
+
+    if (shared.booked) return false; // another tab already won
+
+    const dialogInfo = await page.evaluate(() => {
+      const container = document.querySelector('mat-dialog-container');
+      if (!container) return null;
+      const titleEl = container.querySelector('mat-dialog-title, h2, [mat-dialog-title]');
+      return { title: titleEl ? titleEl.textContent.trim() : '', body: container.textContent.trim() };
+    });
+
+    if (!dialogInfo) {
+      log(`\n✅  ${tag} SUCCESS on attempt ${attempt}!`);
+      log('Complete your personal details and payment to finish the booking.');
+      shared.booked = true;
+      return true;
+    }
+
+    const { title: dialogTitle, body: dialogBody } = dialogInfo;
+
+    if (dialogBody.includes('Prior to your visit')) {
+      log(`${tag} Attempt ${attempt}: "Prior to your visit" — clicking Acknowledge…`);
+      const acknowledged = await page.evaluate(() => {
+        const btn = document.querySelector('#confirmButton');
+        if (btn) { btn.click(); return true; }
+        return false;
+      });
+      if (!acknowledged) {
+        await page.keyboard.press('Escape');
+        log(`${tag} WARNING: #confirmButton not found — sent Escape.`);
+      }
+      log(`\n✅  ${tag} SUCCESS on attempt ${attempt}!`);
+      log('Complete your personal details and payment to finish the booking.');
+      shared.booked = true;
+      return true;
+    }
+
+    const isNotYetAllowed =
+      dialogBody.includes('not yet allowed') ||
+      dialogBody.includes('cannot be reserved until');
+    const isCannotReserve =
+      dialogTitle.includes('Cannot Reserve') ||
+      dialogBody.includes('Cannot Reserve');
+
+    if (isNotYetAllowed || isCannotReserve) {
+      const closed = await page.evaluate(() => {
+        const btn = document.querySelector('#closeButton');
+        if (btn) { btn.click(); return true; }
+        return false;
+      });
+      if (!closed) await page.keyboard.press('Escape');
+      await sleep(300);
+      continue;
+    }
+
+    if (dialogBody.includes('cookies')) {
+      await page.evaluate(() => {
+        const c = document.querySelector('mat-dialog-container');
+        const btn = c && c.querySelector('button');
+        if (btn) btn.click();
+      });
+      await sleep(300);
+      continue;
+    }
+
+    log(`${tag} Attempt ${attempt}: Unexpected dialog: "${dialogBody.trim().slice(0, 120)}"`);
+    log('Browser left open — complete the booking manually.');
+    shared.booked = true;
+    return true;
+  }
+
+  if (!shared.booked) {
+    log(`${tag} All ${CONFIG.maxRetryAttempts} attempts exhausted.`);
+  }
+  return false;
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function bookCampsite() {
@@ -287,6 +543,7 @@ async function bookCampsite() {
   log('Ontario Parks Campsite Auto-Booker starting…');
   log(`Sites (priority order): ${CONFIG.sites.map((s) => s.label).join(' → ')}`);
   log(`Booking opens         : ${openTimeStr}`);
+  log(`Check-in date         : ${BOOKING_START_DATE}  →  Check-out: ${BOOKING_END_DATE}  (${BOOKING_NIGHTS} night${BOOKING_NIGHTS !== 1 ? 's' : ''})`);
   if (secsUntilOpen > 0) {
     log(`⏳  Booking starts in  : ${minsUntilOpen >= 2 ? `~${minsUntilOpen} minutes` : `~${secsUntilOpen} seconds`}`);
   } else {
@@ -295,7 +552,7 @@ async function bookCampsite() {
   log(`Max attempts per site : ${CONFIG.maxRetryAttempts}`);
   log(`Login starts at       : T-${CONFIG.preLoginSecondsBefore}s (${new Date(CONFIG.bookingOpenTime.getTime() - CONFIG.preLoginSecondsBefore * 1000).toLocaleTimeString()})`);
   log(`Page reloads at       : T-${CONFIG.preReloadSecondsBefore}s (${new Date(CONFIG.bookingOpenTime.getTime() - CONFIG.preReloadSecondsBefore * 1000).toLocaleTimeString()})`);
-  log('Pass --sites 228,201,210 to change priority  |  --attempts N to change retries');
+  log(`Pass --sites ${CONFIG.sites.map((s) => s.label).join(',')} to change priority  |  --attempts N to change retries`);
 
   // ── Launch browser or connect to existing Chrome ────────────────────────
   // Chrome must be running with --remote-debugging-port=9222 for tab reuse.
@@ -334,17 +591,12 @@ async function bookCampsite() {
       log(`Waiting to reload page (T-${CONFIG.preReloadSecondsBefore}s before booking opens)…`);
       await waitUntil(reloadMs);
     }
-    log('Reloading map with fresh search time…');
+    log('Pre-loading booking page — site tabs will handle the rest…');
     await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
     await dismissCookieBanner(page);
-
-    // Page is now pre-loaded at T-60s. The for-loop below will click the marker,
-    // open the sidebar, and then waitUntil(bookingOpenTime) so Reserve fires at T=0.
-    log('Booking page pre-loaded and ready — awaiting booking window inside site loop.');
+    // Site tabs open next and navigate independently, waiting until bookingOpenTime internally
   } else if (runNow) {
-    // --now mode: login immediately and skip all waiting
-    const _tNow = new Date();
-    log(`⏰  Running immediately (--now mode). Booking started at ${_tNow.getHours().toString().padStart(2,'0')}:${_tNow.getMinutes().toString().padStart(2,'0')}:${_tNow.getSeconds().toString().padStart(2,'0')}.${_tNow.getMilliseconds().toString().padStart(3,'0')}`);
+    // --now mode: login immediately, site tabs will waitUntil(bookingOpenTime) internally
     await performLogin(page);
   } else {
     // Already past the login start time — login now, then still wait for bookingOpenTime
@@ -353,17 +605,16 @@ async function bookCampsite() {
 
     const reloadMs = CONFIG.bookingOpenTime.getTime() - CONFIG.preReloadSecondsBefore * 1000;
     if (Date.now() < reloadMs) {
-      log(`Waiting to reload page (T-${CONFIG.preReloadSecondsBefore}s before booking opens)…`);
+      log(`Waiting to pre-load site tabs (T-${CONFIG.preReloadSecondsBefore}s before booking opens)…`);
       await waitUntil(reloadMs);
     }
-    log('Reloading map with fresh search time…');
+    log('Pre-loading booking page — site tabs will handle the rest…');
     await page.goto(buildUrl(), { waitUntil: 'networkidle', timeout: CONFIG.mapRenderTimeout });
     await dismissCookieBanner(page);
-
-    log('Booking page pre-loaded and ready — awaiting booking window inside site loop.');
+    // Site tabs open next and navigate independently, waiting until bookingOpenTime internally
   }
 
-  log('Map pre-loaded and ready.');
+  log('Pre-load phase complete — opening site tabs…');
 
 
   if (debugMode) {
@@ -446,238 +697,20 @@ async function bookCampsite() {
     return;
   }
 
-  // ── Try each site in priority order ──────────────────────────────────────
-  let booked = false;
+  // ── Try each site in order — first available wins ──────────────────────
+  const shared = { booked: false };
+  const sitePage = await browserContext.newPage();
 
   for (const site of CONFIG.sites) {
-    if (booked) break;
-
-    // Step 1 & 2: Find the site label on the Leaflet map and click its icon
+    if (shared.booked) break;
     log(`\n── Trying Site ${site.label} ──`);
-    log('Waiting for map-site-label marker…');
-
-    // First wait for any label to appear (map rendered), then filter for ours
-    try {
-      await page.waitForSelector('div.map-site-label', { state: 'attached', timeout: 20000 });
-    } catch {
-      log('ERROR: No map-site-label elements appeared within 20 s — map did not render.');
-      break;
+    await bookSiteOnPage(sitePage, site, shared);
+    if (!shared.booked) {
+      log(`Site ${site.label} not booked — trying next site…`);
     }
+  }
 
-    // Each campsite has a label div showing the site number.
-    // We use exact text match so "228" doesn't match "2280" etc.
-    // All geometry is computed inside the page context to avoid Playwright's
-    // visibility checks (Leaflet markers are inside overflow:hidden containers).
-    const clicked = await page.evaluate((siteLabel) => {
-      // Find the label div with this exact site number
-      const labels = Array.from(document.querySelectorAll('div.map-site-label'));
-      const label = labels.find((el) => el.textContent.trim() === siteLabel);
-      if (!label) return { ok: false, reason: 'label not found' };
-
-      const lr = label.getBoundingClientRect();
-      const lx = lr.x + lr.width / 2;
-      const ly = lr.y + lr.height / 2;
-
-      // Find the closest map-icon to this label (same lat/lng on the Leaflet map)
-      const icons = Array.from(document.querySelectorAll('div.leaflet-marker-icon.map-icon'));
-      if (icons.length === 0) return { ok: false, reason: 'no map-icon elements found' };
-
-      let best = null;
-      let bestDist = Infinity;
-      icons.forEach((el) => {
-        const r = el.getBoundingClientRect();
-        const cx = r.x + r.width / 2;
-        const cy = r.y + r.height / 2;
-        const dist = Math.hypot(cx - lx, cy - ly);
-        if (dist < bestDist) { bestDist = dist; best = el; }
-      });
-
-      best.click();
-      return { ok: true, dist: Math.round(bestDist) };
-    }, site.label);
-
-    if (!clicked.ok) {
-      log(`ERROR: Could not click Site ${site.label} — ${clicked.reason}.`);
-      continue;
-    }
-
-    log(`Clicked icon for Site ${site.label} (${clicked.dist}px from label).`);
-
-    // Step 3: Wait for sidebar, then check if the site is already taken
-    try {
-      await page.waitForSelector('app-side-bar-site-details', { timeout: 8000 });
-    } catch {
-      log(`ERROR: Sidebar did not appear after clicking Site ${site.label}.`);
-      continue;
-    }
-
-    // Wait for the sidebar to show THIS site's name (it may lag from a previous click)
-    let siteName = '';
-    for (let i = 0; i < 20; i++) {
-      siteName = await page.locator('#resourceName').textContent({ timeout: 3000 }).catch(() => '');
-      if (siteName.includes(site.label)) break;
-      await sleep(300);
-    }
-    log(`Sidebar site: "${siteName.trim()}"`);
-
-    // Check for the alert box in the sidebar.
-    // If it shows the site is genuinely taken by someone else → skip to next site.
-    // If it shows "not yet allowed" → proceed to Reserve anyway; the popup after
-    // clicking Reserve is the authoritative signal (and we handle it in the loop).
-    const alertBox = page.locator(
-      'app-side-bar-site-details #sidebarRestrictiveMessageHeading'
-    );
-    const alertVisible = await alertBox.isVisible().catch(() => false);
-
-    if (alertVisible) {
-      const alertText = await alertBox.textContent().catch(() => '');
-      const notYetOpen =
-        alertText.includes('not yet allowed') ||
-        alertText.includes('cannot be reserved until');
-
-      if (notYetOpen) {
-        // Window not open yet — fall through and let the Reserve popup loop handle it
-        log(`Site ${site.label}: sidebar says not yet open — proceeding to click Reserve…`);
-      } else {
-        // Taken by someone else — move to next site
-        log(`Site ${site.label} is already booked by someone else — trying next site…`);
-        continue;
-      }
-    }
-
-    // Steps 4–6: Wait until exactly bookingOpenTime, then fire Reserve.
-    // First site: waits here with sidebar already open → Reserve at T=0.000.
-    // Fallback sites: already past T=0 → waitUntil is a no-op, Reserve immediately.
-    if (Date.now() < CONFIG.bookingOpenTime.getTime()) {
-      log(`Site ${site.label} ready — waiting for booking window at ${CONFIG.bookingOpenTime.toLocaleTimeString()}…`);
-      await waitUntil(CONFIG.bookingOpenTime.getTime());
-    }
-    const _tR = new Date();
-    log(`⏰  Reserve firing at ${_tR.getHours().toString().padStart(2,'0')}:${_tR.getMinutes().toString().padStart(2,'0')}:${_tR.getSeconds().toString().padStart(2,'0')}.${_tR.getMilliseconds().toString().padStart(3,'0')}`);
-    log(`Site ${site.label} — starting reservation attempts (max ${CONFIG.maxRetryAttempts})…`);
-
-    let attempt = 0;
-
-    while (!booked && attempt < CONFIG.maxRetryAttempts) {
-      attempt++;
-
-      // Click the Reserve button entirely inside the page context to bypass
-      // Playwright's visibility checks (button is inside overflow:hidden sidebar)
-      const btnResult = await page.evaluate(() => {
-        const spans = Array.from(document.querySelectorAll('.mdc-button__label'));
-        const btn = spans.find((el) => el.textContent.trim() === 'Reserve');
-        if (!btn) return 'not_found';
-        const button = btn.closest('button') || btn;
-        button.click();
-        return 'clicked';
-      });
-
-      if (btnResult === 'not_found') {
-        log(`Attempt ${attempt}: Reserve button not found in DOM yet, retrying…`);
-        await sleep(300);
-        continue;
-      }
-
-      log(`Attempt ${attempt}: Reserve clicked — checking for dialog…`);
-
-      // Wait up to 800ms for a dialog to appear
-      await sleep(800);
-
-      // Use evaluate to check dialog presence — avoids Playwright visibility false-negatives
-      const dialogInfo = await page.evaluate(() => {
-        const container = document.querySelector('mat-dialog-container');
-        if (!container) return null;
-        const titleEl = container.querySelector('mat-dialog-title, h2, [mat-dialog-title]');
-        return {
-          title: titleEl ? titleEl.textContent.trim() : '',
-          body: container.textContent.trim(),
-        };
-      });
-
-      if (!dialogInfo) {
-        // No dialog → success
-        log(`\n✅  SUCCESS on attempt ${attempt} for Site ${site.label}!`);
-        log('Complete your personal details and payment to finish the booking.');
-        booked = true;
-        break;
-      }
-
-      const { title: dialogTitle, body: dialogBody } = dialogInfo;
-
-      const isPriorToVisit = dialogBody.includes('Prior to your visit');
-
-      if (isPriorToVisit) {
-        // This is the post-Reserve acknowledgement popup — click #confirmButton
-        log(`Attempt ${attempt}: "Prior to your visit" popup — clicking Acknowledge…`);
-        const acknowledged = await page.evaluate(() => {
-          const btn = document.querySelector('#confirmButton');
-          if (btn) { btn.click(); return true; }
-          return false;
-        });
-        if (!acknowledged) {
-          await page.keyboard.press('Escape');
-          log('WARNING: #confirmButton not found — sent Escape instead.');
-        }
-        log(`\n✅  SUCCESS on attempt ${attempt} for Site ${site.label}!`);
-        log('Complete your personal details and payment to finish the booking.');
-        booked = true;
-        break;
-      }
-
-      const isNotYetAllowed =
-        dialogBody.includes('not yet allowed') ||
-        dialogBody.includes('cannot be reserved until');
-      const isCannotReserve =
-        dialogTitle.includes('Cannot Reserve') ||
-        dialogBody.includes('Cannot Reserve');
-
-      if (isNotYetAllowed || isCannotReserve) {
-        // Close #closeButton via evaluate
-        const closed = await page.evaluate(() => {
-          const btn = document.querySelector('#closeButton');
-          if (btn) { btn.click(); return true; }
-          return false;
-        });
-
-        if (!closed) {
-          await page.keyboard.press('Escape');
-          log(`Attempt ${attempt}: #closeButton not found, sent Escape.`);
-        }
-
-        await sleep(300);
-
-        if (isCannotReserve) {
-          log(`Attempt ${attempt}: "Cannot Reserve" popup closed — retrying…`);
-        } else {
-          log(`Attempt ${attempt}: "Not yet allowed" popup closed — retrying…`);
-        }
-        continue;
-      }
-
-      // Unknown dialog — check if it's a stale cookie banner, otherwise stop
-      const preview = dialogBody.trim().slice(0, 120);
-      if (dialogBody.includes('cookies')) {
-        log(`Attempt ${attempt}: Cookie banner still present — dismissing and retrying…`);
-        await page.evaluate(() => {
-          const c = document.querySelector('mat-dialog-container');
-          const btn = c && c.querySelector('button');
-          if (btn) btn.click();
-        });
-        await sleep(300);
-        continue;
-      }
-      log(`Attempt ${attempt}: Unexpected dialog: "${preview}"`);
-      log('Browser left open — complete the booking manually.');
-      booked = true;
-      break;
-    }
-
-    if (!booked) {
-      log(`Site ${site.label}: all ${CONFIG.maxRetryAttempts} attempts exhausted — trying next site…`);
-    }
-  } // end for (const site of CONFIG.sites)
-
-  if (!booked) {
+  if (!shared.booked) {
     log('\n❌  Could not book any site. All sites were taken or attempts exhausted.');
     log('The browser is still open — you can try manually.');
   }
